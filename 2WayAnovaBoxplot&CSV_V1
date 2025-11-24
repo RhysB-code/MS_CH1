@@ -1,0 +1,520 @@
+# =====================================================================
+# Budbreak AUPC — Potted + Complement
+#
+# This script:
+#   - Computes replicate-level AUPC (%·days) for budbreak
+#   - Fits a global 2-way ANOVA: AUPC ~ Genotype * Chill
+#   - Runs Tukey HSD across *all* Genotype × Chill combinations
+#   - Re-maps Tukey letters so that:
+#       * 'a' = highest mean, descending alphabet = decreasing means
+#       * multi-letter groups are alphabetized ("dc" -> "cd")
+#   - Generates two-way summary tables with Tukey letters
+#   - Creates boxplots of AUPC vs Chill, faceted by Genotype
+#   - Outputs all tables and figures to: C:/Users/RhysB/OneDrive/Desktop/ForReport
+# =====================================================================
+
+rm(list = ls())
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(emmeans)
+  library(multcomp)
+  library(RColorBrewer)
+  library(readr)
+  library(grid)
+})
+
+# ---------------------------------------------------------------------
+# Paths + helper functions
+# ---------------------------------------------------------------------
+
+# Input directory: raw chill spreadsheets
+data_dir <- "C:/Users/RhysB/OneDrive/Desktop/Chill Spreadsheets"
+
+# Output directory: tables and figures for report
+out_dir  <- "C:/Users/RhysB/OneDrive/Desktop/ForReport"
+
+# Create output directory if it doesn't already exist
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+}
+
+# Wrapper around ggsave:
+#   - Always saves into out_dir
+#   - Prints the plot to the current device (for interactive runs)
+save_png <- function(p, fname, width = 18, height = 12, dpi = 600) {
+  ggplot2::ggsave(
+    filename = file.path(out_dir, fname),
+    plot     = p,
+    width    = width,
+    height   = height,
+    dpi      = dpi,
+    bg       = "white"
+  )
+  print(p)
+}
+
+# Generic trapezoidal AUC calculator.
+#   x = time (e.g., days), y = response (e.g., budbreak %)
+#   - Converts to numeric
+#   - Drops non-finite values
+#   - Sorts by x and integrates using the trapezoid rule
+compute_auc <- function(x, y) {
+  x <- as.numeric(x)
+  y <- as.numeric(y)
+  
+  ok <- is.finite(x) & is.finite(y)
+  x  <- x[ok]
+  y  <- y[ok]
+  
+  if (length(x) < 2) return(0)
+  
+  o <- order(x)
+  sum((head(y[o], -1) + tail(y[o], -1)) / 2 * diff(x[o]))
+}
+
+# ---------------------------------------------------------------------
+# Letter utilities (for Tukey HSD / CLD output)
+# ---------------------------------------------------------------------
+# multcomp::cld() by default uses 'a' as *lowest* group.
+# We want 'a' = highest mean, then b, c, d, ... = lower groups.
+# These functions transform the raw letter groups from CLD into the
+# desired convention and alphabetize multi-letter groups.
+
+# Invert CLD letter groups so that 'a' becomes highest group.
+# If letters used are a,b,c,d then a<->d, b<->c, etc.
+invert_letters <- function(groups) {
+  if (length(groups) == 0) return(groups)
+  
+  # Collect all unique letters used across all groups
+  all_l <- sort(unique(unlist(strsplit(groups, ""))))
+  if (!length(all_l)) return(groups)
+  
+  # Create mapping: smallest <-> largest, etc.
+  # Example: a,b,c,d => a->d, b->c, c->b, d->a
+  inv <- setNames(rev(all_l), all_l)
+  
+  vapply(
+    groups,
+    function(g) {
+      chars <- strsplit(g, "")[[1]]
+      if (!length(chars)) return("")
+      paste0(inv[chars], collapse = "")
+    },
+    character(1L)
+  )
+}
+
+# Alphabetize letters *within* a group:
+#   "dc" -> "cd", "dcb" -> "bcd"
+sort_letters <- function(groups) {
+  vapply(
+    groups,
+    function(g) {
+      chars <- strsplit(g, "")[[1]]
+      if (!length(chars)) return("")
+      paste(sort(chars), collapse = "")
+    },
+    character(1L)
+  )
+}
+
+# Convenience: trim whitespace, invert letters so that 'a' = highest,
+# then alphabetize multi-letter groups
+fix_letters <- function(groups) {
+  sort_letters(invert_letters(stringr::str_trim(groups)))
+}
+
+# ---------------------------------------------------------------------
+# Generic function:
+#   replicate-level AUPC dataframe => 2-way ANOVA table + boxplot
+#
+# df_auc must contain:
+#   - Genotype
+#   - Treatment (coded factor levels, e.g. 0,1,2,3,4,5)
+#   - AUPC_or_AUHC (numeric response)
+#   - Units (string, e.g. "%·days")
+#
+# Arguments:
+#   treat_codes  : internal treatment codes (e.g. c("0","1","2","3","4","5"))
+#   treat_labels : labels to display on plots/tables (e.g. c("0","168","336","504","672","840"))
+#   palette      : named vector of colors, keyed by treat_labels
+#   study_tag    : "Potted" or "Complement" (used in titles/messages)
+#   stub         : filename stub for outputs (no extension)
+# ---------------------------------------------------------------------
+
+make_aupc_2way_outputs <- function(df_auc,
+                                   treat_codes,
+                                   treat_labels,
+                                   palette,
+                                   study_tag,
+                                   stub) {
+  
+  # Check that required columns are present
+  stopifnot(all(c("Genotype", "Treatment", "AUPC_or_AUHC", "Units") %in% names(df_auc)))
+  
+  # Map coded Treatment levels (e.g. "0","1","2") to Chill labels (e.g. "0","168","336")
+  lab_map <- setNames(treat_labels, treat_codes)
+  
+  df_auc <- df_auc %>%
+    dplyr::mutate(
+      Treatment = factor(as.character(Treatment), levels = treat_codes),
+      Chill     = factor(lab_map[as.character(Treatment)], levels = treat_labels)
+    )
+  
+  # ---------- 1) Global 2-way ANOVA (Option A) -----------------------
+  # Model is fit directly on AUPC_or_AUHC; no sign-flipping here.
+  fit_auc <- stats::aov(AUPC_or_AUHC ~ Genotype * Chill, data = df_auc)
+  
+  # Genotype main effect: CLD + cleaned letters
+  emm_G <- emmeans::emmeans(fit_auc, ~ Genotype)
+  cld_G <- multcomp::cld(emm_G, Letters = letters, adjust = "tukey", alpha = 0.05) %>%
+    as.data.frame() %>%
+    dplyr::transmute(
+      Genotype,
+      Genotype_Letters = fix_letters(.group)
+    )
+  
+  # Chill main effect: CLD + cleaned letters
+  emm_C <- emmeans::emmeans(fit_auc, ~ Chill)
+  cld_C <- multcomp::cld(emm_C, Letters = letters, adjust = "tukey", alpha = 0.05) %>%
+    as.data.frame() %>%
+    dplyr::transmute(
+      Chill,
+      Chill_Letters = fix_letters(.group)
+    )
+  
+  # Genotype × Chill interaction — GLOBAL Tukey across ALL combinations
+  emm_GC <- emmeans::emmeans(fit_auc, ~ Genotype * Chill)  # no "by"
+  
+  cld_GC <- multcomp::cld(emm_GC, Letters = letters, adjust = "tukey", alpha = 0.05) %>%
+    as.data.frame() %>%
+    dplyr::transmute(
+      Genotype,
+      Chill,
+      GxC_Letters = fix_letters(.group)
+    )
+  
+  # ---------- 2) Mean ± SE per Genotype × Chill ----------------------
+  
+  summary_gt <- df_auc %>%
+    dplyr::group_by(Chill, Treatment, Genotype) %>%
+    dplyr::summarise(
+      Mean = mean(AUPC_or_AUHC, na.rm = TRUE),
+      SE   = stats::sd(AUPC_or_AUHC, na.rm = TRUE) / sqrt(dplyr::n()),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      # Formatted "Mean ± SE" string for tables
+      AUPC_fmt = sprintf("%.2f \u00B1 %.2f", Mean, SE),
+      # Numeric Chill for sorting
+      ChillNum = as.numeric(as.character(Chill))
+    ) %>%
+    # Attach main-effect and interaction letters
+    dplyr::left_join(cld_G,  by = "Genotype") %>%
+    dplyr::left_join(cld_C,  by = "Chill") %>%
+    dplyr::left_join(cld_GC, by = c("Genotype", "Chill")) %>%
+    dplyr::arrange(ChillNum, Genotype)
+  
+  # ---------- 3) Output summary table --------------------------------
+  
+  # Keep genotype name and each letter set in its own column
+  table_out <- summary_gt %>%
+    dplyr::transmute(
+      `Chill Hours`      = as.character(Chill),
+      Genotype           = Genotype,
+      AUPC               = AUPC_fmt,
+      Genotype_MS        = Genotype_Letters,
+      Chill_MS           = Chill_Letters,
+      `Genotype x Chill` = GxC_Letters
+    )
+  
+  table_file <- file.path(out_dir, paste0(stub, "_TwoWayANOVA_Table.csv"))
+  readr::write_csv(table_out, table_file)
+  
+  message(study_tag, " table written: ", normalizePath(table_file))
+  
+  # ---------- 4) Boxplot: AUPC vs Chill, faceted by Genotype ---------
+  
+  # Set y-axis upper limit with some headroom for letters
+  ymax <- max(df_auc$AUPC_or_AUHC, na.rm = TRUE) * 1.30
+  
+  # Get per-genotype/chill y-position for placing letters slightly above max
+  y_pos <- df_auc %>%
+    dplyr::group_by(Genotype, Chill) %>%
+    dplyr::summarise(
+      y = max(AUPC_or_AUHC, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::group_by(Genotype) %>%
+    dplyr::mutate(
+      y = y + 0.20 * max(y, na.rm = TRUE)
+    ) %>%
+    dplyr::ungroup()
+  
+  # Join GxC letters with y-positions for plotting
+  letters_plot <- summary_gt %>%
+    dplyr::select(Genotype, Chill, GxC_Letters) %>%
+    dplyr::distinct() %>%
+    dplyr::inner_join(y_pos, by = c("Genotype", "Chill")) %>%
+    dplyr::filter(!is.na(GxC_Letters))
+  
+  # Map palette to treatment labels
+  pal_chill <- palette[treat_labels]
+  
+  # Extract units string (if multiple, use the first)
+  units_str <- unique(df_auc$Units)
+  if (length(units_str) != 1) units_str <- units_str[1]
+  
+  # Main boxplot
+  p <- ggplot2::ggplot(
+    df_auc,
+    ggplot2::aes(x = Chill, y = AUPC_or_AUHC, fill = Chill)
+  ) +
+    ggplot2::geom_boxplot(
+      width        = 0.65,
+      outlier.shape = 16,
+      outlier.size  = 2.2,
+      linewidth     = 0.55
+    ) +
+    # Tukey letters plotted above each box
+    ggplot2::geom_text(
+      data        = letters_plot,
+      ggplot2::aes(x = Chill, y = y, label = GxC_Letters),
+      inherit.aes = FALSE,
+      vjust       = 0,
+      size        = 6.5,   # larger letters
+      fontface    = "bold"
+    ) +
+    ggplot2::facet_wrap(~ Genotype, nrow = 2, drop = FALSE) +
+    ggplot2::scale_fill_manual(values = pal_chill, name = "Chill Hours") +
+    ggplot2::labs(
+      title = paste0(study_tag, ": Budbreak AUPC — Genotype × Chill (Tukey, a = highest)"),
+      x     = "Chill Hours",
+      y     = paste0("AUPC (", units_str, ")")
+    ) +
+    ggplot2::scale_y_continuous(expand = expansion(mult = c(0.03, 0.12))) +
+    ggplot2::coord_cartesian(
+      ylim   = c(0, ymax),
+      expand = FALSE,
+      clip   = "off"
+    ) +
+    ggplot2::theme_bw(base_size = 18) +
+    ggplot2::theme(
+      plot.title   = ggplot2::element_text(size = 22, face = "bold"),
+      axis.title.x = ggplot2::element_text(size = 20, face = "bold"),
+      axis.title.y = ggplot2::element_text(size = 20, face = "bold"),
+      axis.text.x  = ggplot2::element_text(size = 16),
+      axis.text.y  = ggplot2::element_text(size = 16),
+      strip.text   = ggplot2::element_text(size = 20, face = "bold"),
+      legend.title = ggplot2::element_text(size = 18),
+      legend.text  = ggplot2::element_text(size = 16),
+      panel.spacing = grid::unit(10, "pt"),
+      legend.position = "bottom"
+    )
+  
+  # Save plot
+  png_file <- paste0(stub, "_GxChill_Boxplot.png")
+  save_png(p, png_file, width = 18, height = 10, dpi = 600)
+  
+  # Invisibly return objects in case you want them in the workspace
+  invisible(list(
+    table = table_out,
+    plot  = p
+  ))
+}
+
+# =====================================================================
+# PART A — POTTED Budbreak AUPC
+# =====================================================================
+
+# Coded treatment levels in data
+p_treat_codes  <- c("0", "1", "2", "3", "4", "5")
+# Display labels (chill hours)
+p_treat_labels <- c("0", "168", "336", "504", "672", "840")
+
+# Manual color palette for Potted treatments (labels as names)
+p_palette <- c(
+  "0"   = "#E69F00",
+  "168" = "#56B4E9",
+  "336" = "#009E73",
+  "504" = "#F0E442",
+  "672" = "#0072B2",
+  "840" = "#D55E00"
+)
+
+# Read potted dataset
+potted <- read.csv(file.path(data_dir, "Analysis_Spreadsheet__Potted_Final__ForR.csv"))
+names(potted) <- make.names(trimws(names(potted)), unique = TRUE)
+
+# Reshape function for Potted budbreak time-course data
+reshape_potted_budbreak <- function(df) {
+  # Candidate ID columns (we take whichever are present)
+  id_all  <- c("Genotype", "Treatment", "Rep", "Replicate", "plant_ID", "Plant", "ID")
+  id_cols <- intersect(id_all, names(df))
+  if (!length(id_cols)) {
+    stop("Potted: no ID columns (Genotype/Treatment/Rep/Replicate/Plant/ID) found.")
+  }
+  
+  # Time-course budbreak columns (e.g., "X1Day_Potted_Budbreak", ...)
+  trait_cols <- names(df)[grepl("Day_Potted_Budbreak$", names(df))]
+  if (!length(trait_cols)) {
+    stop("Potted: no '*Day_Potted_Budbreak' columns found. Check column names.")
+  }
+  
+  df %>%
+    dplyr::select(dplyr::any_of(id_cols), dplyr::any_of(trait_cols)) %>%
+    tidyr::pivot_longer(
+      cols      = dplyr::any_of(trait_cols),
+      names_to  = "Day_Col",
+      values_to = "Value"
+    ) %>%
+    # Extract numeric day from column name (handles optional 'X' prefix)
+    dplyr::mutate(
+      Day = as.numeric(stringr::str_match(Day_Col, "X?(\\d+)Day_")[, 2])
+    ) %>%
+    # Build a unified replicate identifier (.rep) from whichever columns are present
+    dplyr::mutate(
+      .rep = dplyr::coalesce(
+        !!!rlang::syms(intersect(c("Replicate", "Rep", "plant_ID", "Plant", "ID"), names(.)))
+      )
+    ) %>%
+    # Drop rows with missing response or missing day
+    dplyr::filter(!is.na(Value), !is.na(Day))
+}
+
+# Long-format Potted budbreak data
+p_bud_long <- reshape_potted_budbreak(potted) %>%
+  dplyr::mutate(
+    # Order genotypes explicitly for facets
+    Genotype = factor(
+      Genotype,
+      levels = c("A-2491T", "Natchez", "Navaho", "Ouachita", "Ponca", "Von")
+    ),
+    Treatment = factor(as.character(Treatment), levels = p_treat_codes)
+  )
+
+# If data are on 0–1 scale, convert to %; otherwise leave as-is
+scale_factor_p <- ifelse(max(p_bud_long$Value, na.rm = TRUE) <= 1, 100, 1)
+
+p_bud_long <- p_bud_long %>%
+  dplyr::mutate(Value_pct = Value * scale_factor_p)
+
+# Compute replicate-level AUPC for Potted
+p_aupc_reps <- p_bud_long %>%
+  dplyr::arrange(Genotype, Treatment, .rep, Day) %>%
+  dplyr::group_by(Genotype, Treatment, .rep) %>%
+  dplyr::summarise(
+    AUPC_or_AUHC = compute_auc(Day, Value_pct),
+    Units        = ifelse(scale_factor_p == 100, "%·days", "count·days"),
+    .groups      = "drop"
+  )
+
+# Run 2-way ANOVA + Tukey + boxplots for Potted AUPC
+potted_out <- make_aupc_2way_outputs(
+  df_auc       = p_aupc_reps,
+  treat_codes  = p_treat_codes,
+  treat_labels = p_treat_labels,
+  palette      = p_palette,
+  study_tag    = "Potted",
+  stub         = "Potted_Budbreak_AUPC"
+)
+
+# =====================================================================
+# PART B — COMPLEMENT Budbreak AUPC
+# =====================================================================
+
+# Here, treatment codes and labels are the actual chill hours
+c_treat_codes  <- c("0", "226", "353", "479", "596", "712", "853")
+c_treat_labels <- c_treat_codes
+
+# Manual color palette for Complement treatments
+c_palette <- c(
+  "0"   = "#E69F00",
+  "226" = "#56B4E9",
+  "353" = "#009E73",
+  "479" = "#F0E442",
+  "596" = "#0072B2",
+  "712" = "#D55E00",
+  "853" = "#CC79A7"
+)
+
+# Read Complement dataset
+comp_raw <- read.csv(file.path(data_dir, "Analysis_Spreadsheet__Complement_Final_ForR.csv"))
+names(comp_raw) <- make.names(trimws(names(comp_raw)), unique = TRUE)
+
+# If Complement.ID is present but Genotype is not, rename it to Genotype
+if ("Complement.ID" %in% names(comp_raw) && !("Genotype" %in% names(comp_raw))) {
+  comp_raw <- comp_raw %>%
+    dplyr::rename(Genotype = Complement.ID)
+}
+
+# Reshape function for Complement budbreak time-course data
+reshape_complement_budbreak <- function(df) {
+  # Candidate ID columns (same logic as Potted)
+  id_all  <- c("Genotype", "Treatment", "Rep", "Replicate", "plant_ID", "Plant", "ID")
+  id_cols <- intersect(id_all, names(df))
+  if (!length(id_cols)) {
+    stop("Complement: no ID columns (Genotype/Treatment/Rep/Replicate/Plant/ID) found.")
+  }
+  
+  # Complement budbreak day columns
+  trait_cols <- names(df)[grepl("Day_Complement_Budbreak$", names(df))]
+  if (!length(trait_cols)) {
+    stop("Complement: no '*Day_Complement_Budbreak' columns found. Check column names.")
+  }
+  
+  df %>%
+    dplyr::select(dplyr::any_of(id_cols), dplyr::any_of(trait_cols)) %>%
+    tidyr::pivot_longer(
+      cols      = dplyr::any_of(trait_cols),
+      names_to  = "Day_Col",
+      values_to = "Value"
+    ) %>%
+    dplyr::mutate(
+      Day = as.numeric(stringr::str_match(Day_Col, "X?(\\d+)Day_")[, 2])
+    ) %>%
+    dplyr::mutate(
+      .rep = dplyr::coalesce(
+        !!!rlang::syms(intersect(c("Replicate", "Rep", "plant_ID", "Plant", "ID"), names(.)))
+      )
+    ) %>%
+    dplyr::filter(!is.na(Value), !is.na(Day))
+}
+
+# Long-format Complement budbreak data
+c_bud_long <- reshape_complement_budbreak(comp_raw) %>%
+  dplyr::mutate(
+    Treatment = factor(as.character(Treatment), levels = c_treat_codes)
+  )
+
+# Again, convert to % if on 0–1 scale
+scale_factor_c <- ifelse(max(c_bud_long$Value, na.rm = TRUE) <= 1, 100, 1)
+
+c_bud_long <- c_bud_long %>%
+  dplyr::mutate(Value_pct = Value * scale_factor_c)
+
+# Compute replicate-level AUPC for Complement
+c_aupc_reps <- c_bud_long %>%
+  dplyr::arrange(Genotype, Treatment, .rep, Day) %>%
+  dplyr::group_by(Genotype, Treatment, .rep) %>%
+  dplyr::summarise(
+    AUPC_or_AUHC = compute_auc(Day, Value_pct),
+    Units        = ifelse(scale_factor_c == 100, "%·days", "count·days"),
+    .groups      = "drop"
+  )
+
+# Run 2-way ANOVA + Tukey + boxplots for Complement AUPC
+complement_out <- make_aupc_2way_outputs(
+  df_auc       = c_aupc_reps,
+  treat_codes  = c_treat_codes,
+  treat_labels = c_treat_labels,
+  palette      = c_palette,
+  study_tag    = "Complement",
+  stub         = "Complement_Budbreak_AUPC"
+)
+
+message("All Budbreak AUPC outputs written to: ", normalizePath(out_dir))
