@@ -466,11 +466,12 @@ potted_out <- make_aupc_2way_outputs(
 # PART B — COMPLEMENT Budbreak AUPC
 # =====================================================================
 
-# Here, treatment codes and labels are the actual chill hours
-c_treat_codes  <- c("0", "226", "353", "479", "596", "712", "853")
-c_treat_labels <- c_treat_codes
+# In the Complement file, Treatment is coded as 0–6.
+# Here we map those codes to actual chill hours for labels.
+c_treat_codes  <- c("0", "1", "2", "3", "4", "5", "6")
+c_treat_labels <- c("0", "226", "353", "479", "596", "712", "853")
 
-# Manual color palette for Complement treatments
+# Manual color palette for Complement treatments (labels as names)
 c_palette <- c(
   "0"   = "#E69F00",
   "226" = "#56B4E9",
@@ -499,13 +500,13 @@ reshape_complement_budbreak <- function(df) {
   if (!length(id_cols)) {
     stop("Complement: no ID columns (Genotype/Treatment/Rep/Replicate/Plant/ID) found.")
   }
-  
-  # Complement budbreak day columns
+
+  # Complement budbreak day columns, e.g. "...Day_Complement_Budbreak"
   trait_cols <- names(df)[grepl("Day_Complement_Budbreak$", names(df))]
   if (!length(trait_cols)) {
     stop("Complement: no '*Day_Complement_Budbreak' columns found. Check column names.")
   }
-  
+
   df %>%
     dplyr::select(dplyr::any_of(id_cols), dplyr::any_of(trait_cols)) %>%
     tidyr::pivot_longer(
@@ -513,24 +514,28 @@ reshape_complement_budbreak <- function(df) {
       names_to  = "Day_Col",
       values_to = "Value"
     ) %>%
+    # Extract numeric day from column name (handles optional 'X' prefix)
     dplyr::mutate(
       Day = as.numeric(stringr::str_match(Day_Col, "X?(\\d+)Day_")[, 2])
     ) %>%
+    # Build a unified replicate identifier (.rep) from whichever columns are present
     dplyr::mutate(
       .rep = dplyr::coalesce(
         !!!rlang::syms(intersect(c("Replicate", "Rep", "plant_ID", "Plant", "ID"), names(.)))
       )
     ) %>%
+    # Drop rows with missing response or missing day
     dplyr::filter(!is.na(Value), !is.na(Day))
 }
 
 # Long-format Complement budbreak data
 c_bud_long <- reshape_complement_budbreak(comp_raw) %>%
   dplyr::mutate(
+    # Factor using 0–6 codes from the file
     Treatment = factor(as.character(Treatment), levels = c_treat_codes)
   )
 
-# Again, convert to % if on 0–1 scale
+# Convert to % if on 0–1 scale; otherwise leave as-is
 scale_factor_c <- ifelse(max(c_bud_long$Value, na.rm = TRUE) <= 1, 100, 1)
 
 c_bud_long <- c_bud_long %>%
@@ -546,7 +551,7 @@ c_aupc_reps <- c_bud_long %>%
     .groups      = "drop"
   )
 
-# Run 2-way ANOVA + Tukey + boxplots for Complement AUPC
+# Run 2-way ANOVA + CLD + boxplots for Complement AUPC
 complement_out <- make_aupc_2way_outputs(
   df_auc       = c_aupc_reps,
   treat_codes  = c_treat_codes,
@@ -555,5 +560,6 @@ complement_out <- make_aupc_2way_outputs(
   study_tag    = "Complement",
   stub         = "Complement_Budbreak_AUPC"
 )
+
 
 message("All Budbreak AUPC outputs written to: ", normalizePath(out_dir))
