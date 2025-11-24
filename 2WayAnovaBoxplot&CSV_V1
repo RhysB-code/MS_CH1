@@ -4,11 +4,12 @@
 # This script:
 #   - Computes replicate-level AUPC (%·days) for budbreak
 #   - Fits a global 2-way ANOVA: AUPC ~ Genotype * Chill
-#   - Runs Tukey HSD across *all* Genotype × Chill combinations
-#   - Re-maps Tukey letters so that:
+#   - Runs Tukey/adjusted CLD across *all* Genotype × Chill combinations
+#   - Re-maps CLD letters so that:
 #       * 'a' = highest mean, descending alphabet = decreasing means
-#       * multi-letter groups are alphabetized ("dc" -> "cd")
-#   - Generates two-way summary tables with Tukey letters
+#       * multi-letter groups are alphabetized and compressed to ranges:
+#           e.g., "ijklm" -> "i-m"
+#   - Generates two-way summary tables with letters
 #   - Creates boxplots of AUPC vs Chill, faceted by Genotype
 #   - Outputs all tables and figures to: C:/Users/RhysB/OneDrive/Desktop/ForReport
 # =====================================================================
@@ -81,8 +82,8 @@ compute_auc <- function(x, y) {
 # ---------------------------------------------------------------------
 # multcomp::cld() by default uses 'a' as *lowest* group.
 # We want 'a' = highest mean, then b, c, d, ... = lower groups.
-# These functions transform the raw letter groups from CLD into the
-# desired convention and alphabetize multi-letter groups.
+# Also, we want to compress long contiguous letter runs:
+#   "ijklm" -> "i-m", "abcfg" -> "a-c,f-g".
 
 # Invert CLD letter groups so that 'a' becomes highest group.
 # If letters used are a,b,c,d then a<->d, b<->c, etc.
@@ -122,10 +123,48 @@ sort_letters <- function(groups) {
   )
 }
 
+# Compress sorted letter groups into ranges where possible:
+#   "ijklm" -> "i-m"
+#   "ab"    -> "a-b"
+#   "c"     -> "c"
+#   "abcfg" -> "a-c,f-g"
+compress_letters <- function(groups) {
+  vapply(
+    groups,
+    function(g) {
+      chars <- unlist(strsplit(g, ""))
+      if (!length(chars)) return("")
+      
+      # Map letters to positions 1..26 (a..z), keep unique + sorted
+      pos <- sort(unique(match(chars, letters)))
+      
+      # Split into runs of consecutive positions
+      runs <- split(pos, cumsum(c(1, diff(pos) != 1)))
+      
+      # Turn each run into either a single letter or "first-last"
+      parts <- vapply(
+        runs,
+        function(r) {
+          if (length(r) == 1) {
+            letters[r]
+          } else {
+            paste0(letters[min(r)], "-", letters[max(r)])
+          }
+        },
+        character(1L)
+      )
+      
+      paste(parts, collapse = ",")
+    },
+    character(1L)
+  )
+}
+
 # Convenience: trim whitespace, invert letters so that 'a' = highest,
-# then alphabetize multi-letter groups
+# then alphabetize multi-letter groups and compress into ranges.
 fix_letters <- function(groups) {
-  sort_letters(invert_letters(stringr::str_trim(groups)))
+  compressed <- sort_letters(invert_letters(stringr::str_trim(groups)))
+  compress_letters(compressed)
 }
 
 # ---------------------------------------------------------------------
@@ -275,7 +314,7 @@ make_aupc_2way_outputs <- function(df_auc,
     ggplot2::aes(x = Chill, y = AUPC_or_AUHC, fill = Chill)
   ) +
     ggplot2::geom_boxplot(
-      width        = 0.65,
+      width         = 0.65,
       outlier.shape = 16,
       outlier.size  = 2.2,
       linewidth     = 0.55
@@ -292,7 +331,7 @@ make_aupc_2way_outputs <- function(df_auc,
     ggplot2::facet_wrap(~ Genotype, nrow = 2, drop = FALSE) +
     ggplot2::scale_fill_manual(values = pal_chill, name = "Chill Hours") +
     ggplot2::labs(
-      title = paste0(study_tag, ": Budbreak AUPC — Genotype × Chill (Tukey, a = highest)"),
+      title = paste0(study_tag, ": Budbreak AUPC — Genotype × Chill (Tukey-style letters, a = highest)"),
       x     = "Chill Hours",
       y     = paste0("AUPC (", units_str, ")")
     ) +
@@ -304,14 +343,14 @@ make_aupc_2way_outputs <- function(df_auc,
     ) +
     ggplot2::theme_bw(base_size = 18) +
     ggplot2::theme(
-      plot.title   = ggplot2::element_text(size = 22, face = "bold"),
-      axis.title.x = ggplot2::element_text(size = 20, face = "bold"),
-      axis.title.y = ggplot2::element_text(size = 20, face = "bold"),
-      axis.text.x  = ggplot2::element_text(size = 16),
-      axis.text.y  = ggplot2::element_text(size = 16),
-      strip.text   = ggplot2::element_text(size = 20, face = "bold"),
-      legend.title = ggplot2::element_text(size = 18),
-      legend.text  = ggplot2::element_text(size = 16),
+      plot.title    = ggplot2::element_text(size = 22, face = "bold"),
+      axis.title.x  = ggplot2::element_text(size = 20, face = "bold"),
+      axis.title.y  = ggplot2::element_text(size = 20, face = "bold"),
+      axis.text.x   = ggplot2::element_text(size = 16),
+      axis.text.y   = ggplot2::element_text(size = 16),
+      strip.text    = ggplot2::element_text(size = 20, face = "bold"),
+      legend.title  = ggplot2::element_text(size = 18),
+      legend.text   = ggplot2::element_text(size = 16),
       panel.spacing = grid::unit(10, "pt"),
       legend.position = "bottom"
     )
