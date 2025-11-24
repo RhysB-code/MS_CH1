@@ -331,7 +331,7 @@ make_aupc_2way_outputs <- function(df_auc,
     ggplot2::facet_wrap(~ Genotype, nrow = 2, drop = FALSE) +
     ggplot2::scale_fill_manual(values = pal_chill, name = "Chill Hours") +
     ggplot2::labs(
-      title = paste0(study_tag, ": Budbreak AUPC — Genotype × Chill (Tukey-style letters, a = highest)"),
+      title = paste0(study_tag, ": Budbreak AUPC (Genotype × Chill Interaction)"),
       x     = "Chill Hours",
       y     = paste0("AUPC (", units_str, ")")
     ) +
@@ -563,3 +563,4 @@ complement_out <- make_aupc_2way_outputs(
 
 
 message("All Budbreak AUPC outputs written to: ", normalizePath(out_dir))
+
